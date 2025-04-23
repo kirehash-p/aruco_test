@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>ArUco Marker Overlay with OpenCV.js</title>
+  <style>
+    body { margin: 0; overflow: hidden; }
+    video, img { display: none; }
+    #canvasOutput { 
+      position: absolute; 
+      top: 0; 
+      left: 0; 
+      width: 100%; 
+      height: 100%; 
+      object-fit: contain; /* 変更: cover から contain へ変更して縦横両方に収める */
+    }
+    #controls {
+      position: absolute;
+      bottom: 10px;
+      left: 10px;
+      background: rgba(0,0,0,0.7);
+      color: white;
+      padding: 10px;
+      border-radius: 5px;
+      z-index: 1000;
+    }
+    #controls label {
+      display: block;
+      margin: 5px 0;
+    }
+    #controls select, #controls input {
+      margin-left: 10px;
+    }
+    #fileUpload {
+      margin-top: 10px;
+    }
+  </style>
+</head>
+<body>
+  <!-- カメラ映像取得用 -->
+  <video id="videoInput" playsinline autoplay></video>
+  <!-- 描画用キャンバス -->
+  <canvas id="canvasOutput"></canvas>
+  <!-- 合成用デフォルト画像 -->
+  <img id="defaultImage" src="assets/default.jpg" alt="default">
+  <!-- アップロードされた画像表示用 -->
+  <img id="uploadedImage" alt="uploaded image">
+
+  <!-- 操作用コントロールパネル -->
+  <div id="controls">
+    <label>
+      合成画像:
+      <select id="overlaySelect">
+        <option value="defaultImage">デフォルト</option>
+        <option value="uploadedImage">アップロード画像</option>
+      </select>
+    </label>
+    <label>
+      透明度:
+      <input type="range" id="opacitySlider" min="0" max="100" value="80">
+      <span id="opacityValue">80%</span>
+    </label>
+    <label>
+      <input type="checkbox" id="showMarkers" checked>
+      マーカー枠を表示
+    </label>
+    <div id="fileUpload">
+      <label>
+        画像をアップロード:
+        <input type="file" id="imageInput" accept="image/*">
+      </label>
+    </div>
+  </div>
+
+  <!-- 1) launchApp を先に宣言 -->
+  <script>
+    async function launchApp() {
+      console.log('▶ Module.onRuntimeInitialized');
+      if (cv instanceof Promise) {
+        console.log('⏳ Awaiting cv promise…');
+        cv = await cv;
+      }
+      console.log('✅ cv promise resolved');
+      startProcessing();
+    }
+  </script>
+
+  <!-- 2) Module 設定 -->
+  <script>
+    var Module = {
+      locateFile: path => path.endsWith('.wasm') ? 'js/opencv_js.wasm' : path,
+      onRuntimeInitialized: launchApp
+    };
+  </script>
+
+  <!-- 3) loader.js と OpenCV.js を同期ロード -->
+  <script src="js/loader.js"></script>
+  <script src="js/opencv.js"></script>
+
+  <!-- 4) アプリ本体 -->
+  <script>
+    function startProcessing() {
+      console.log('▶ startProcessing()');
+      const video  = document.getElementById('videoInput');
+      const canvas = document.getElementById('canvasOutput');
+      const ctx    = canvas.getContext('2d');
+      
+      // UI要素の参照を取得
+      const overlaySelect = document.getElementById('overlaySelect');
+      // 透明度スライダーを非表示にする（100%固定のため）
+      const opacitySlider = document.getElementById('opacitySlider');
+      const opacityValue = document.getElementById('opacityValue');
+      opacitySlider.value = 100; // 透明度を100%に固定
+      opacityValue.textContent = '100%';
+      opacitySlider.parentElement.style.display = 'none'; // 透明度スライダーを非表示
+      
+      const showMarkers = document.getElementById('showMarkers');
+      const imageInput = document.getElementById('imageInput');
+      const uploadedImage = document.getElementById('uploadedImage');
+      
+      // パフォーマンス関連の変数を追加
+      let isProcessing = false;
+      let frameSkipCount = 0;
+      const FRAME_SKIP = 1; // 処理するフレームの間隔 (0=スキップなし、1=1フレームおき)
+      
+      // 画像アップロードのイベントリスナー
+      imageInput.addEventListener('change', (event) => {
+        const file = event.target.files[0];
+        if (file) {
+          const reader = new FileReader();
+          reader.onload = (e) => {
+            uploadedImage.src = e.target.result;
+          };
+          reader.readAsDataURL(file);
+        }
+      });
+
+      navigator.mediaDevices.getUserMedia({ video: true })
+        .then(stream => {
+          console.log('✔ getUserMedia success');
+          video.srcObject = stream;
+        })
+        .catch(err => console.error('✖ getUserMedia error:', err));
+
+      video.addEventListener('loadedmetadata', () => {
+        canvas.width  = video.videoWidth;
+        canvas.height = video.videoHeight;
+
+        // Mat オブジェクトの準備
+        let src  = new cv.Mat(video.videoHeight, video.videoWidth, cv.CV_8UC4);
+        let dst  = new cv.Mat(video.videoHeight, video.videoWidth, cv.CV_8UC4);
+        let gray = new cv.Mat();
+        
+        // 透視変換用の行列
+        let perspectiveMatrix = new cv.Mat();
+        let warpedOverlay = new cv.Mat();
+
+        // ArUco 辞書と検出器（3パラメータを明示）
+        const dictionary     = cv.getPredefinedDictionary(cv.DICT_4X4_50);
+        const detectorParams = new cv.aruco_DetectorParameters();
+        const refineParams   = new cv.aruco_RefineParameters(10.0, 3.0, true);
+        const detector       = new cv.aruco_ArucoDetector(
+          dictionary, detectorParams, refineParams
+        );
+
+        function processFrame() {
+          try {
+            // フレームスキップ処理
+            if (frameSkipCount < FRAME_SKIP) {
+              frameSkipCount++;
+              requestAnimationFrame(processFrame);
+              return;
+            }
+            frameSkipCount = 0;
+            
+            // 別の処理中なら終了
+            if (isProcessing) {
+              requestAnimationFrame(processFrame);
+              return;
+            }
+            isProcessing = true;
+
+            // カメラ映像を src にセット
+            ctx.drawImage(video, 0, 0);
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            src.data.set(imageData.data);
+
+            // グレースケール変換 → マーカー検出
+            cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+            const corners = new cv.MatVector();
+            const ids     = new cv.Mat();
+            detector.detectMarkers(gray, corners, ids);
+
+            // 処理用に src を dst にコピー
+            src.copyTo(dst);
+
+            if (ids.rows > 0) {
+              // 現在選択されている合成用画像を取得
+              const overlayImageId = overlaySelect.value;
+              const overlay = cv.imread(document.getElementById(overlayImageId));
+              
+              // マーカーIDでソート（ID順に処理するため）
+              const sortedIndices = [];
+              for (let i = 0; i < ids.rows; i++) {
+                sortedIndices.push({ id: ids.data32S[i], index: i });
+              }
+              sortedIndices.sort((a, b) => a.id - b.id);
+              
+              // マーカーが4つ検出された場合のみ透視変換を適用
+              if (ids.rows >= 4) {
+                // 四隅のマーカーを探す（ID 0, 1, 2, 3を想定）
+                const cornerPoints = [];
+                let hasAllCorners = true;
+                
+                // ID 0～3を持つマーカーが全て存在するか確認
+                for (let id = 0; id < 4; id++) {
+                  const found = sortedIndices.find(item => item.id === id);
+                  if (!found) {
+                    hasAllCorners = false;
+                    break;
+                  }
+                  
+                  // マーカーの中心座標を計算
+                  const markerIndex = found.index;
+                  const corner = corners.get(markerIndex);
+                  cornerPoints.push({ id: id, corner: corner });
+                }
+                
+                if (hasAllCorners) {
+                  // 四隅マーカーのそれぞれの座標を取得
+                  const topLeft = cornerPoints.find(p => p.id === 0);
+                  const topRight = cornerPoints.find(p => p.id === 1);
+                  const bottomRight = cornerPoints.find(p => p.id === 2);
+                  const bottomLeft = cornerPoints.find(p => p.id === 3);
+                  
+                  // 変換元の座標（オーバーレイ画像の四隅）
+                  const srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
+                    0, 0,                       // 左上
+                    overlay.cols, 0,            // 右上
+                    overlay.cols, overlay.rows, // 右下
+                    0, overlay.rows             // 左下
+                  ]);
+                  
+                  // マーカーの中心位置を四隅に使用
+                  const dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
+                    topLeft.corner.data32F[0], topLeft.corner.data32F[1],         // 左上
+                    topRight.corner.data32F[2], topRight.corner.data32F[3],       // 右上
+                    bottomRight.corner.data32F[4], bottomRight.corner.data32F[5], // 右下
+                    bottomLeft.corner.data32F[6], bottomLeft.corner.data32F[7]    // 左下
+                  ]);
+                  
+                  // 透視変換行列を計算
+                  perspectiveMatrix = cv.getPerspectiveTransform(srcTri, dstTri);
+                  
+                  // オーバーレイ画像を変形
+                  cv.warpPerspective(
+                    overlay, 
+                    warpedOverlay,
+                    perspectiveMatrix,
+                    new cv.Size(dst.cols, dst.rows),
+                    cv.INTER_LINEAR,
+                    cv.BORDER_CONSTANT,
+                    new cv.Scalar()
+                  );
+                  
+                  // カメラ映像の上に合成画像を重ねて表示する
+                  // マスクを作成して合成画像の不透明部分だけを取り出す
+                  let mask = new cv.Mat();
+                  let rgbaChannels = new cv.MatVector();
+                  cv.split(warpedOverlay, rgbaChannels);
+                  
+                  if (rgbaChannels.size() > 3) {
+                    // アルファチャンネル（透明度）を取得
+                    mask = rgbaChannels.get(3);
+                  } else {
+                    // アルファチャンネルがない場合は画像の不透明部分をマスクにする
+                    mask = new cv.Mat(warpedOverlay.rows, warpedOverlay.cols, cv.CV_8UC1, new cv.Scalar(255));
+                    // RGB値がすべて0の（黒い）部分は透明とみなす
+                    let blackMask = new cv.Mat();
+                    cv.cvtColor(warpedOverlay, blackMask, cv.COLOR_RGBA2GRAY);
+                    cv.threshold(blackMask, blackMask, 1, 255, cv.THRESH_BINARY);
+                    cv.bitwise_and(mask, blackMask, mask);
+                    blackMask.delete();
+                  }
+                  
+                  // マスクを使って元の画像（dst）に合成画像（warpedOverlay）を重ねる
+                  warpedOverlay.copyTo(dst, mask);
+                  
+                  // リソース解放
+                  mask.delete();
+                  for (let i = 0; i < rgbaChannels.size(); i++) {
+                    rgbaChannels.get(i).delete();
+                  }
+                  rgbaChannels.delete();
+                  srcTri.delete();
+                  dstTri.delete();
+                }
+              }
+              
+              // マーカー枠の描画（オプション）
+              if (showMarkers.checked) {
+                for (let i = 0; i < corners.size(); i++) {
+                  const corner = corners.get(i);
+                  const id = ids.data32S[i];
+                  
+                  // 1) 四隅を緑線で結ぶ
+                  for (let j = 0; j < 4; j++) {
+                    const x1 = corner.data32F[j*2], y1 = corner.data32F[j*2+1];
+                    const x2 = corner.data32F[((j+1)%4)*2], y2 = corner.data32F[((j+1)%4)*2+1];
+                    cv.line(
+                      dst,
+                      new cv.Point(x1, y1),
+                      new cv.Point(x2, y2),
+                      new cv.Scalar(0, 255, 0, 255),
+                      2
+                    );
+                  }
+                  
+                  // 2) 中心に ID（青文字）を描画
+                  const cx = (corner.data32F[0] + corner.data32F[2]
+                            + corner.data32F[4] + corner.data32F[6]) / 4;
+                  const cy = (corner.data32F[1] + corner.data32F[3]
+                            + corner.data32F[5] + corner.data32F[7]) / 4;
+                  cv.putText(
+                    dst,
+                    id.toString(),
+                    new cv.Point(cx, cy),
+                    cv.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    new cv.Scalar(255, 0, 0, 255),
+                    2
+                  );
+                }
+              }
+              
+              // オーバーレイ画像のメモリ解放
+              overlay.delete();
+            }
+
+            // 合成表示
+            cv.imshow('canvasOutput', dst);
+            
+            // メモリ解放
+            if (corners) corners.delete();
+            if (ids) ids.delete();
+            
+            isProcessing = false;
+          } catch (e) {
+            console.error('processFrame error:', e);
+            isProcessing = false; // エラー時もフラグをリセット
+          }
+          requestAnimationFrame(processFrame);
+        }
+
+        // ループ開始
+        requestAnimationFrame(processFrame);
+      });
+    }
+  </script>
+</body>
+</html>
