@@ -1,269 +1,226 @@
 <!DOCTYPE html>
 <html lang="ja">
 <head>
-  <meta charset="UTF-8">
-  <title>ArUco Marker Overlay with OpenCV.js</title>
-  <style>
-    body { margin: 0; overflow: hidden; }
-    video, img { display: none; }
-    #canvasOutput { 
-      position: absolute; 
-      top: 0; left: 0; 
-      width: 100%; height: 100%; 
-      object-fit: contain;
-    }
-    #controls {
-      position: absolute; bottom: 10px; left: 10px;
-      background: rgba(0,0,0,0.7); color: white;
-      padding: 10px; border-radius: 5px; z-index: 1000;
-    }
-    #controls label { display: block; margin: 5px 0; }
-    #controls select, #controls input { margin-left: 10px; }
-    #fileUpload { margin-top: 10px; }
-  </style>
+<meta charset="UTF-8">
+<title>ArUco Marker Overlay with OpenCV.js</title>
+<style>
+  body{margin:0;overflow:hidden}
+  video,img{display:none}
+  #canvasOutput{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain}
+  #controls{position:absolute;bottom:10px;left:10px;background:rgba(0,0,0,.7);color:#fff;
+            padding:10px;border-radius:5px;z-index:1000}
+  #controls label{display:block;margin:5px 0}
+  #controls select,#controls input{margin-left:10px}
+  #fileUpload{margin-top:10px}
+</style>
 </head>
 <body>
-  <video id="videoInput" playsinline autoplay></video>
-  <canvas id="canvasOutput"></canvas>
-  <img id="defaultImage" src="assets/default.jpg" alt="default">
-  <img id="uploadedImage" alt="uploaded">
+<video id="videoInput" playsinline autoplay></video>
+<canvas id="canvasOutput"></canvas>
+<img id="defaultImage" src="assets/default.jpg" alt="default">
+<img id="uploadedImage" alt="uploaded">
+<div id="controls">
+  <label>カメラ選択:<select id="cameraSelect"></select></label>
+  <label>合成画像:
+    <select id="overlaySelect">
+      <option value="defaultImage">デフォルト</option>
+      <option value="uploadedImage">アップロード画像</option>
+    </select>
+  </label>
+  <label><input type="checkbox" id="showMarkers" checked> マーカー枠を表示</label>
+  <div id="fileUpload"><label>画像をアップロード:<input type="file" id="imageInput" accept="image/*"></label></div>
+</div>
 
-  <div id="controls">
-    <label>
-      カメラ選択:
-      <select id="cameraSelect"></select>
-    </label>
-    <label>
-      合成画像:
-      <select id="overlaySelect">
-        <option value="defaultImage">デフォルト</option>
-        <option value="uploadedImage">アップロード画像</option>
-      </select>
-    </label>
-    <label>
-      <input type="checkbox" id="showMarkers" checked>
-      マーカー枠を表示
-    </label>
-    <div id="fileUpload">
-      <label>
-        画像をアップロード:
-        <input type="file" id="imageInput" accept="image/*">
-      </label>
-    </div>
-  </div>
+<script>
+async function launchApp(){ if(cv instanceof Promise) cv = await cv; startProcessing(); }
+</script>
+<script>var Module={locateFile:p=>p.endsWith('.wasm')?'js/opencv_js.wasm':p,onRuntimeInitialized:launchApp};</script>
+<script src="js/loader.js"></script>
+<script src="js/opencv.js"></script>
 
-  <script>
-    async function launchApp() {
-      console.log('▶ Module.onRuntimeInitialized');
-      if (cv instanceof Promise) {
-        console.log('⏳ Awaiting cv promise…');
-        cv = await cv;
+<script>
+async function startProcessing(){
+  const video=document.getElementById('videoInput');
+  const canvas=document.getElementById('canvasOutput'),ctx=canvas.getContext('2d');
+  const cameraSelect=document.getElementById('cameraSelect');
+  const overlaySelect=document.getElementById('overlaySelect');
+  const showMarkers=document.getElementById('showMarkers');
+  const imageInput=document.getElementById('imageInput');
+  const uploadedImage=document.getElementById('uploadedImage');
+
+  let currentStream=null,frameSkip=0,FRAME_SKIP=1,isProcessing=false;
+  try{const s=await navigator.mediaDevices.getUserMedia({video:true});s.getTracks().forEach(t=>t.stop());}catch(e){console.warn(e);}
+  const cams=(await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==='videoinput');
+  cams.forEach((c,i)=>{const o=document.createElement('option');o.value=c.deviceId;o.text=c.label||`Camera ${i+1}`;cameraSelect.appendChild(o);});
+  cameraSelect.addEventListener('change',()=>startCamera(cameraSelect.value));
+  if(cams.length)startCamera(cams[0].deviceId);
+  function startCamera(id){
+    if(currentStream)currentStream.getTracks().forEach(t=>t.stop());
+    navigator.mediaDevices.getUserMedia({video:{deviceId:{exact:id}},audio:false})
+      .then(s=>{currentStream=s;video.srcObject=s;})
+      .catch(e=>console.error(e));
+  }
+  imageInput.addEventListener('change',e=>{
+    const f=e.target.files[0];if(f){const r=new FileReader();r.onload=d=>uploadedImage.src=d.target.result;r.readAsDataURL(f);}
+  });
+
+  video.addEventListener('loadedmetadata',()=>{
+    canvas.width=video.videoWidth;canvas.height=video.videoHeight;
+    const src=new cv.Mat(video.videoHeight,video.videoWidth,cv.CV_8UC4);
+    const dst=src.clone(),gray=new cv.Mat(),warped=new cv.Mat();
+    let perspective=null;          // let にして毎フレーム更新
+    const dict=cv.getPredefinedDictionary(cv.DICT_4X4_50);
+    const detector=new cv.aruco_ArucoDetector(
+      dict,
+      new cv.aruco_DetectorParameters(),
+      new cv.aruco_RefineParameters(10.0,3.0,true)
+    );
+
+    /* ---------- 幾何ユーティリティ ---------- */
+    const getEdge=(m,side)=>{
+      switch(side){
+        case"top":return [m[0],m[1]];
+        case"right":return [m[1],m[2]];
+        case"bottom":return [m[2],m[3]];
+        case"left":return [m[3],m[0]];
       }
-      console.log('✅ cv promise resolved');
-      startProcessing();
-    }
-  </script>
-
-  <script>
-    var Module = {
-      locateFile: path => path.endsWith('.wasm') ? 'js/opencv_js.wasm' : path,
-      onRuntimeInitialized: launchApp
     };
-  </script>
+    const lineIntersect=(p1,p2,p3,p4)=>{
+      const a1=p2[1]-p1[1],b1=p1[0]-p2[0],c1=a1*p1[0]+b1*p1[1];
+      const a2=p4[1]-p3[1],b2=p3[0]-p4[0],c2=a2*p3[0]+b2*p3[1];
+      const det=a1*b2-a2*b1; if(Math.abs(det)<1e-5) return null;
+      return [(b2*c1-b1*c2)/det,(a1*c2-a2*c1)/det];
+    };
 
-  <script src="js/loader.js"></script>
-  <script src="js/opencv.js"></script>
+    /* ---------- 4 頂点推定 ---------- */
+    function buildAnchors(idsMat,corners){
+      const cMap=new Map();
+      for(let i=0;i<idsMat.rows;i++){
+        const id=idsMat.data32S[i];
+        const c=corners.get(i);
+        cMap.set(id,[
+          [c.data32F[0],c.data32F[1]], // 0:TL
+          [c.data32F[2],c.data32F[3]], // 1:TR
+          [c.data32F[4],c.data32F[5]], // 2:BR
+          [c.data32F[6],c.data32F[7]]  // 3:BL
+        ]);
+      }
+      let anchors=[null,null,null,null];
+      for(let k=0;k<4;k++) if(cMap.has(k)) anchors[k]=[...cMap.get(k)[k]];
+      const dbgLines=[],dbgPts=[];
 
-  <script>
-    async function startProcessing() {
-      console.log('▶ startProcessing()');
-      const video         = document.getElementById('videoInput');
-      const canvas        = document.getElementById('canvasOutput');
-      const ctx           = canvas.getContext('2d');
-      const cameraSelect  = document.getElementById('cameraSelect');
-      const overlaySelect = document.getElementById('overlaySelect');
-      const showMarkers   = document.getElementById('showMarkers');
-      const imageInput    = document.getElementById('imageInput');
-      const uploadedImage = document.getElementById('uploadedImage');
-
-      let currentStream = null;
-      let isProcessing  = false;
-      let frameSkipCount = 0, FRAME_SKIP = 1;
-
-      // 1) 初回に全カメラ許可を取ってラベル取得
-      try {
-        const tmpStream = await navigator.mediaDevices.getUserMedia({ video: true });
-        tmpStream.getTracks().forEach(t => t.stop());
-      } catch (err) {
-        console.warn('初回カメラ許可取得に失敗:', err);
+      /* 3 マーカーの場合 ─ 欠けている 1 点を交点で推定 */
+      if(anchors.filter(Boolean).length===3){
+        const miss=anchors.findIndex(a=>!a);
+        const has=id=>cMap.has(id);
+        const e=(id,side)=>has(id)?getEdge(cMap.get(id),side):null;
+        switch(miss){
+          case 0:{
+            const p=lineIntersect(...e(1,"top"),...e(3,"left"));anchors[0]=p;dbgLines.push(e(1,"top"),e(3,"left"));dbgPts.push(p);
+          }break;
+          case 1:{
+            const p=lineIntersect(...e(0,"top"),...e(2,"right"));anchors[1]=p;dbgLines.push(e(0,"top"),e(2,"right"));dbgPts.push(p);
+          }break;
+          case 2:{
+            const p=lineIntersect(...e(1,"right"),...e(3,"bottom"));anchors[2]=p;dbgLines.push(e(1,"right"),e(3,"bottom"));dbgPts.push(p);
+          }break;
+          case 3:{
+            const p=lineIntersect(...e(0,"left"),...e(2,"bottom"));anchors[3]=p;dbgLines.push(e(0,"left"),e(2,"bottom"));dbgPts.push(p);
+          }break;
+        }
       }
 
-      // 2) 許可後にデバイス一覧を取得してセレクトを作成
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      const cams = devices.filter(d => d.kind === 'videoinput');
-      cams.forEach((cam, i) => {
-        const opt = document.createElement('option');
-        opt.value = cam.deviceId;
-        opt.text  = cam.label || `Camera ${i+1}`;
-        cameraSelect.appendChild(opt);
-      });
-
-      // 3) セレクト変更で都度許可＆起動
-      cameraSelect.addEventListener('change', () => {
-        startCamera(cameraSelect.value);
-      });
-
-      // 4) 最初のカメラを起動
-      if (cams.length) startCamera(cams[0].deviceId);
-
-      // カメラ起動関数（deviceId指定で都度許可ダイアログが出る）
-      function startCamera(deviceId) {
-        if (currentStream) {
-          currentStream.getTracks().forEach(t => t.stop());
+      /* 対角 2 点 (1 と 3) → 0,2 を推定 */
+      if(anchors.filter(Boolean).length===2){
+        const idsSet=new Set([...cMap.keys()]);
+        /* 0・2 欠落 (1,3 検出) */
+        if(idsSet.has(1)&&idsSet.has(3)){
+          const m1=cMap.get(1),m3=cMap.get(3);
+          anchors[1]=m1[1];anchors[3]=m3[3];
+          const p0=lineIntersect(...getEdge(m1,"top"),...getEdge(m3,"left"));   // ★ FIX
+          const p2=lineIntersect(...getEdge(m1,"right"),...getEdge(m3,"bottom")); // ★ FIX
+          anchors[0]=p0;anchors[2]=p2;
+          dbgLines.push(getEdge(m1,"top"),getEdge(m3,"left"),getEdge(m1,"right"),getEdge(m3,"bottom"));
+          dbgPts.push(p0,p2);
         }
-        navigator.mediaDevices.getUserMedia({
-          video: { deviceId: { exact: deviceId } },
-          audio: false
-        })
-        .then(stream => {
-          console.log('✔ getUserMedia success:', deviceId);
-          currentStream = stream;
-          video.srcObject  = stream;
-        })
-        .catch(err => console.error('✖ getUserMedia error:', err));
+        /* 1・3 欠落 (0,2 検出) */
+        else if(idsSet.has(0)&&idsSet.has(2)){
+          const m0=cMap.get(0),m2=cMap.get(2);
+          anchors[0]=m0[0];anchors[2]=m2[2];
+          const p1=lineIntersect(...getEdge(m0,"top"),...getEdge(m2,"right"));
+          const p3=lineIntersect(...getEdge(m0,"left"),...getEdge(m2,"bottom"));
+          anchors[1]=p1;anchors[3]=p3;
+          dbgLines.push(getEdge(m0,"top"),getEdge(m2,"right"),getEdge(m0,"left"),getEdge(m2,"bottom"));
+          dbgPts.push(p1,p3);
+        }
       }
-
-      // アップロード画像取得
-      imageInput.addEventListener('change', e => {
-        const file = e.target.files[0];
-        if (file) {
-          const reader = new FileReader();
-          reader.onload = ev => uploadedImage.src = ev.target.result;
-          reader.readAsDataURL(file);
-        }
-      });
-
-      video.addEventListener('loadedmetadata', () => {
-        canvas.width  = video.videoWidth;
-        canvas.height = video.videoHeight;
-
-        // OpenCV Mat 準備
-        let src  = new cv.Mat(video.videoHeight, video.videoWidth, cv.CV_8UC4);
-        let dst  = new cv.Mat(video.videoHeight, video.videoWidth, cv.CV_8UC4);
-        let gray = new cv.Mat();
-        let perspectiveMatrix = new cv.Mat();
-        let warpedOverlay     = new cv.Mat();
-
-        const dictionary     = cv.getPredefinedDictionary(cv.DICT_4X4_50);
-        const detectorParams = new cv.aruco_DetectorParameters();
-        const refineParams   = new cv.aruco_RefineParameters(10.0, 3.0, true);
-        const detector       = new cv.aruco_ArucoDetector(dictionary, detectorParams, refineParams);
-
-        function processFrame() {
-          try {
-            if (frameSkipCount < FRAME_SKIP) {
-              frameSkipCount++;
-              requestAnimationFrame(processFrame);
-              return;
-            }
-            frameSkipCount = 0;
-            if (isProcessing) {
-              requestAnimationFrame(processFrame);
-              return;
-            }
-            isProcessing = true;
-
-            ctx.drawImage(video, 0, 0);
-            let imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-            src.data.set(imageData.data);
-
-            cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-            let corners = new cv.MatVector();
-            let ids     = new cv.Mat();
-            detector.detectMarkers(gray, corners, ids);
-
-            src.copyTo(dst);
-
-            if (ids.rows > 0) {
-              const overlayEl = document.getElementById(overlaySelect.value);
-              let overlay = cv.imread(overlayEl);
-
-              let sorted = [];
-              for (let i = 0; i < ids.rows; i++) sorted.push({id: ids.data32S[i], index: i});
-              sorted.sort((a,b)=>a.id-b.id);
-
-              if (ids.rows >= 4) {
-                let pts = [], ok = true;
-                for (let id=0; id<4; id++){
-                  let f = sorted.find(o=>o.id===id);
-                  if (!f) { ok=false; break; }
-                  pts.push(corners.get(f.index));
-                }
-                if (ok) {
-                  const srcTri = cv.matFromArray(4,1,cv.CV_32FC2,[
-                    0,0,
-                    overlay.cols,0,
-                    overlay.cols,overlay.rows,
-                    0,overlay.rows
-                  ]);
-                  const dstTri = cv.matFromArray(4,1,cv.CV_32FC2,[
-                    pts[0].data32F[0], pts[0].data32F[1],
-                    pts[1].data32F[2], pts[1].data32F[3],
-                    pts[2].data32F[4], pts[2].data32F[5],
-                    pts[3].data32F[6], pts[3].data32F[7]
-                  ]);
-                  perspectiveMatrix = cv.getPerspectiveTransform(srcTri, dstTri);
-                  cv.warpPerspective(overlay, warpedOverlay, perspectiveMatrix,
-                                     new cv.Size(dst.cols, dst.rows),
-                                     cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar());
-                  let mask = new cv.Mat();
-                  let rgba = new cv.MatVector();
-                  cv.split(warpedOverlay, rgba);
-                  if (rgba.size()>3) mask = rgba.get(3);
-                  else {
-                    mask = new cv.Mat(warpedOverlay.rows, warpedOverlay.cols, cv.CV_8UC1, new cv.Scalar(255));
-                    let black = new cv.Mat();
-                    cv.cvtColor(warpedOverlay, black, cv.COLOR_RGBA2GRAY);
-                    cv.threshold(black, black, 1, 255, cv.THRESH_BINARY);
-                    cv.bitwise_and(mask, black, mask);
-                    black.delete();
-                  }
-                  warpedOverlay.copyTo(dst, mask);
-                  mask.delete(); rgba.delete();
-                  srcTri.delete(); dstTri.delete();
-                }
-              }
-
-              if (showMarkers.checked) {
-                for (let i=0; i<corners.size(); i++){
-                  let c = corners.get(i);
-                  let id = ids.data32S[i];
-                  for (let j=0; j<4; j++){
-                    let x1=c.data32F[j*2], y1=c.data32F[j*2+1];
-                    let x2=c.data32F[((j+1)%4)*2], y2=c.data32F[((j+1)%4)*2+1];
-                    cv.line(dst, new cv.Point(x1,y1), new cv.Point(x2,y2), new cv.Scalar(0,255,0,255),2);
-                  }
-                  let cx=(c.data32F[0]+c.data32F[2]+c.data32F[4]+c.data32F[6])/4;
-                  let cy=(c.data32F[1]+c.data32F[3]+c.data32F[5]+c.data32F[7])/4;
-                  cv.putText(dst, id.toString(), new cv.Point(cx,cy),
-                             cv.FONT_HERSHEY_SIMPLEX,1,new cv.Scalar(255,0,0,255),2);
-                }
-              }
-              overlay.delete();
-            }
-
-            cv.imshow('canvasOutput', dst);
-            corners.delete(); ids.delete();
-          } catch (e) {
-            console.error('processFrame error:', e);
-          }
-          isProcessing = false;
-          requestAnimationFrame(processFrame);
-        }
-
-        requestAnimationFrame(processFrame);
-      });
+      return {anchors,dbgLines,dbgPts};
     }
-  </script>
+
+    /* ---------- メインループ ---------- */
+    function loop(){
+      try{
+        if(frameSkip++<FRAME_SKIP){requestAnimationFrame(loop);return;}
+        frameSkip=0;if(isProcessing){requestAnimationFrame(loop);return;}
+        isProcessing=true;
+
+        ctx.drawImage(video,0,0);
+        src.data.set(ctx.getImageData(0,0,canvas.width,canvas.height).data);
+        cv.cvtColor(src,gray,cv.COLOR_RGBA2GRAY);
+
+        const corners=new cv.MatVector(),ids=new cv.Mat();
+        detector.detectMarkers(gray,corners,ids);
+        src.copyTo(dst);
+
+        if(ids.rows>0){
+          const {anchors,dbgLines,dbgPts}=buildAnchors(ids,corners);
+          const ok=anchors.every(Boolean);
+
+          if(ok){
+            const ol=cv.imread(document.getElementById(overlaySelect.value));
+            const srcTri=cv.matFromArray(4,1,cv.CV_32FC2,[0,0,ol.cols,0,ol.cols,ol.rows,0,ol.rows]);
+            const dstTri=cv.matFromArray(4,1,cv.CV_32FC2,[
+              anchors[0][0],anchors[0][1],anchors[1][0],anchors[1][1],
+              anchors[2][0],anchors[2][1],anchors[3][0],anchors[3][1]
+            ]);
+            if(perspective)perspective.delete();
+            perspective=cv.getPerspectiveTransform(srcTri,dstTri);
+            cv.warpPerspective(ol,warped,perspective,new cv.Size(dst.cols,dst.rows),
+                               cv.INTER_LINEAR,cv.BORDER_CONSTANT,new cv.Scalar());
+            const ch=new cv.MatVector();cv.split(warped,ch);
+            const mask=ch.size()>3?ch.get(3):new cv.Mat(warped.rows,warped.cols,cv.CV_8UC1,new cv.Scalar(255));
+            warped.copyTo(dst,mask);
+            ch.delete();mask.delete();srcTri.delete();dstTri.delete();ol.delete();
+          }
+
+          /* デバッグ描画 */
+          if(showMarkers.checked){
+            for(let i=0;i<corners.size();i++){
+              const c=corners.get(i),id=ids.data32S[i];
+              for(let j=0;j<4;j++){
+                cv.line(dst,new cv.Point(c.data32F[j*2],c.data32F[j*2+1]),
+                            new cv.Point(c.data32F[((j+1)%4)*2],c.data32F[((j+1)%4)*2+1]),
+                            new cv.Scalar(0,255,0,255),2);
+              }
+              const cx=(c.data32F[0]+c.data32F[2]+c.data32F[4]+c.data32F[6])/4;
+              const cy=(c.data32F[1]+c.data32F[3]+c.data32F[5]+c.data32F[7])/4;
+              cv.putText(dst,id.toString(),new cv.Point(cx,cy),cv.FONT_HERSHEY_SIMPLEX,1,new cv.Scalar(255,0,0,255),2);
+            }
+            dbgLines.forEach(l=>{
+              cv.line(dst,new cv.Point(l[0][0],l[0][1]),new cv.Point(l[1][0],l[1][1]),new cv.Scalar(0,165,255,255),2);
+            });
+            dbgPts.forEach(p=>{
+              cv.circle(dst,new cv.Point(p[0],p[1]),6,new cv.Scalar(0,0,255,255),-1);
+            });
+          }
+        }
+        cv.imshow('canvasOutput',dst);
+      }catch(e){console.error(e);}
+      isProcessing=false;requestAnimationFrame(loop);
+    }
+    requestAnimationFrame(loop);
+  });
+}
+</script>
 </body>
 </html>
